@@ -9,6 +9,7 @@ example readable; a real ledger would store integer pence.
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -47,11 +48,19 @@ def role() -> str:
 
 
 @contextmanager
-def db():
-    con = sqlite3.connect(os.environ["BANK_DB"])
+def db(*, immediate: bool = False):
+    """One transaction. `immediate` takes the write lock up front, for check-then-write.
+
+    The MCP server runs sync tools in worker threads, and the agent sends a batch of tool
+    calls at once, so two calls can interleave. A rule like "at most 3 attempts" or "only an
+    open case" holds only if the check and the write happen under the same lock.
+    """
+    con = sqlite3.connect(os.environ["BANK_DB"], timeout=10)
     con.row_factory = sqlite3.Row
     try:
         with con:
+            if immediate:
+                con.execute("BEGIN IMMEDIATE")
             yield con
     finally:
         con.close()
@@ -97,7 +106,9 @@ def untrusted(text: str) -> str:
     #   came from a third party (here, payment memos written by merchants) is fenced and
     #   labelled, and the agent screens it (S7). Both are probabilistic; the credit limit in
     #   resolve_case is the deterministic backstop.
-    return f"<untrusted_text>{text}</untrusted_text>"
+    # The text is escaped first. Otherwise a memo containing "</untrusted_text>" closes the
+    #   fence early, and whatever follows reaches the model unlabelled and unscreened.
+    return f"<untrusted_text>{html.escape(text, quote=False)}</untrusted_text>"
 
 
 # T3 [TOOLS]: customers write details however they like ("12th April 1988", "se17pb",
@@ -140,31 +151,34 @@ def verify_customer(customer_id: str, date_of_birth: str, postcode: str) -> str:
     """
     customer_id = normalise_id(customer_id)
     args = {"customer_id": customer_id}
-    with db() as c:
+    dob = normalise_date(date_of_birth)
+    # S8 [CONTAIN]: a hard cap on guesses, so the agent can't be used to try details until
+    #   one works. The model can't talk its way past it, and can't get round it by sending
+    #   several guesses in one batch: counting and recording an attempt share one lock.
+    with db(immediate=True) as c:
         failures = c.execute("SELECT COUNT(*) FROM failed_verifications WHERE customer_id=?",
                              (customer_id,)).fetchone()[0]
         row = c.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
-    # S8 [CONTAIN]: a hard cap on guesses, so the agent can't be used to try details until
-    #   one works. The model can't talk its way past it.
-    if failures >= MAX_VERIFY_ATTEMPTS:
+        locked = failures >= MAX_VERIFY_ATTEMPTS
+        matched = bool(row and row["dob"] == dob
+                       and normalise_postcode(row["postcode"]) == normalise_postcode(postcode))
+        if not locked and dob is not None:  # an unreadable date isn't a guess
+            table = "verifications" if matched else "failed_verifications"
+            c.execute(f"INSERT INTO {table} VALUES (?)", (customer_id,))
+    # Refusals are audited after the lock is released: audit() writes on its own connection.
+    if locked:
         raise refuse("verify_customer", args,
                      "Too many failed attempts. Don't try again. Tell the customer to visit a "
                      "branch with photo ID.")
-    dob = normalise_date(date_of_birth)
     if dob is None:
         raise refuse("verify_customer", args,
                      f"Couldn't read '{date_of_birth}' as a date. Ask the customer for their date "
                      "of birth as day, month and year.")
-    if not (row and row["dob"] == dob
-            and normalise_postcode(row["postcode"]) == normalise_postcode(postcode)):
-        with db() as c:
-            c.execute("INSERT INTO failed_verifications VALUES (?)", (customer_id,))
+    if not matched:
         # Deliberately doesn't say which field was wrong, so it can't be used to guess details.
         raise refuse("verify_customer", args,
                      "Verification failed. Don't discuss the account. Ask the customer to check "
                      "their details or visit a branch with photo ID.")
-    with db() as c:
-        c.execute("INSERT INTO verifications VALUES (?)", (customer_id,))
     audit("verify_customer", args, "ok")
     return f"Verified {row['name']} ({customer_id})."
 
@@ -246,11 +260,17 @@ def resolve_case(case_id: int, resolution: str, goodwill_credit_gbp: float = 0.0
         raise refuse("resolve_case", args,
                      f"£{goodwill_credit_gbp:.2f} is outside your authority (up to £{limit:.0f}). "
                      "Use escalate_case and tell the customer a specialist will review it.")
+    # The case was open when checked above, but another call in the same batch may have
+    #   closed it since. Closing only if still open, in the same transaction as the credit,
+    #   means one case can never be credited twice.
     with db() as c:
-        if goodwill_credit_gbp:
+        closed = c.execute("UPDATE cases SET status='resolved', resolution=? "
+                           "WHERE id=? AND status='open'",
+                           (resolution[:MAX_TEXT], case_id)).rowcount
+        if closed and goodwill_credit_gbp:
             c.execute("INSERT INTO credits VALUES (?,?)", (case_id, goodwill_credit_gbp))
-        c.execute("UPDATE cases SET status='resolved', resolution=? WHERE id=?",
-                  (resolution[:MAX_TEXT], case_id))
+    if not closed:
+        raise refuse("resolve_case", args, f"Case {case_id} is not open. Open a case first.")
     audit("resolve_case", args, "resolved")
     return f"Case {case_id} resolved. Credited £{goodwill_credit_gbp:.2f}."
 
@@ -260,9 +280,14 @@ def escalate_case(case_id: int, reason: str, priority: Literal["normal", "high"]
     """Hand an open case to a specialist team. Use for anything outside your authority."""
     args = {"case_id": case_id, "priority": priority}
     open_case_for("escalate_case", case_id, args)
-    with db() as c:
-        c.execute("INSERT INTO escalations VALUES (?,?,?)", (case_id, reason[:MAX_TEXT], priority))
-        c.execute("UPDATE cases SET status='escalated' WHERE id=?", (case_id,))
+    with db() as c:  # as in resolve_case: act only if the case is still open
+        escalated = c.execute("UPDATE cases SET status='escalated' WHERE id=? AND status='open'",
+                              (case_id,)).rowcount
+        if escalated:
+            c.execute("INSERT INTO escalations VALUES (?,?,?)",
+                      (case_id, reason[:MAX_TEXT], priority))
+    if not escalated:
+        raise refuse("escalate_case", args, f"Case {case_id} is not open. Open a case first.")
     audit("escalate_case", args, "escalated")
     return f"Case {case_id} escalated ({priority}). A specialist will contact the customer."
 

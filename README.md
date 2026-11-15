@@ -165,7 +165,10 @@ bank, and CI gates on pass^k rather than pass@k.
 
 Two more decisions matter as much as the graders. Infrastructure errors (an API outage, a rate
 limit) are left out of pass^k and reported separately, so an outage can't look like the agent
-getting worse. And when the judge answers UNKNOWN, the report lists it for a person to review
+getting worse. That works only if the category stays narrow: a bug in the harness or a grader
+(bad SQL in `tasks.yaml`, say) stops the run instead, because counting it as an outage would
+quietly shrink the sample and leave pass^k looking healthy. For the same reason, a gate with no
+regression tasks to check fails rather than passes. And when the judge answers UNKNOWN, the report lists it for a person to review
 rather than quietly counting it as a fail.
 
 The injection screen also gets its own small eval (`evals/screen.py`). It's one classification
@@ -254,7 +257,7 @@ person instead of failing silently.
 | A3 | Simplest design first; a separate evaluator rather than self-grading | `agent.py` docstring, `grade_judge` |
 | A4 | Swappable brain (model), hands (MCP server) and session (history, tool log) | `Agent` |
 | A5 | Tool failures go back to the model as errors, not crashes | `Agent._call_tool` |
-| A6 | Two routes to a person: the model chooses (`hand_off_to_person`) or the harness forces it (budget, refusal). Enforced and counted | `Agent._call_tool`, `Agent._hand_off`, `asks_for_a_person` |
+| A6 | Two routes to a person: the model chooses (`hand_off_to_person`) or the harness forces it (budget, refusal). Enforced and counted: a hand-off stops the rest of its batch, and the model isn't called again | `Agent.run`, `Agent._hand_off`, `asks_for_a_person` |
 
 **Not done here, and why:**
 
