@@ -51,6 +51,13 @@ class Config:
     max_cost_usd: float = 0.50
     role: str = "frontline"
 
+    def __post_init__(self) -> None:
+        # Fail before the first API call, not after it: cost is tracked per call, so a model
+        # with no price would only fail once the call had been made and billed.
+        for model in (self.model, self.guard_model):
+            if model is not None and model not in PRICES:
+                raise ValueError(f"No price for {model!r}. Add it to PRICES in agent.py.")
+
 
 # K2 [docs]: USD per million tokens: (input, output, cache read). A 5-minute cache write costs
 #   1.25x input. Check these against the pricing page before quoting them to anyone.
@@ -232,6 +239,10 @@ class Agent:
     async def run(self, customer_message: str) -> str:
         """Handle one customer message and return the reply. Call again to continue the chat."""
         self.messages.append({"role": "user", "content": customer_message})
+        if self.handoff_reason is not None:
+            # A person owns the conversation now. The message is kept for them, and the agent
+            # doesn't call the model again.
+            return HANDOFF
         for _ in range(self.config.max_turns):
             if self.cost_usd >= self.config.max_cost_usd:
                 return self._hand_off("cost budget")
@@ -257,12 +268,23 @@ class Agent:
             if response.stop_reason == "end_turn":
                 self.stop_reason = "end_turn"
                 return "".join(b.text for b in response.content if b.type == "text")
+            calls = [b for b in response.content if b.type == "tool_use"]
             if response.stop_reason != "tool_use":  # refusal, max_tokens: a person takes over
+                # A response cut off by max_tokens can still hold tool calls. Each one needs a
+                # result, or the history is no longer a valid conversation to hand on.
+                if calls:
+                    self.messages.append({"role": "user", "content": [
+                        {"type": "tool_result", "tool_use_id": b.id, "is_error": True,
+                         "content": "Not run: the response was cut off."} for b in calls]})
                 return self._hand_off(response.stop_reason)
 
+            # A6: a hand-off takes effect before any other call in its batch runs. The calls
+            #   run concurrently, so checking it call by call would depend on their order.
+            for b in calls:
+                if b.name == "hand_off_to_person" and self.handoff_reason is None:
+                    self.handoff_reason = b.input["reason"]
             # A1 [FOLD]: the model emits a batch of tool calls. Run them concurrently and return
             #   every result in ONE user message (splitting them teaches the model not to batch).
-            calls = [b for b in response.content if b.type == "tool_use"]
             results = await asyncio.gather(*(self._call_tool(b) for b in calls))
             self.messages.append({"role": "user", "content": list(results)})
         return self._hand_off("turn budget")
@@ -273,8 +295,7 @@ class Agent:
             text, is_error = "This conversation has been handed to a person. Take no further action.", True
         elif block.name == "load_skill":
             text, is_error = SKILLS[block.input["name"]][1], False
-        elif block.name == "hand_off_to_person":
-            self.handoff_reason = block.input["reason"]
+        elif block.name == "hand_off_to_person":  # recorded by run() before the batch started
             text, is_error = "Handed off. Tell the customer a colleague will contact them.", False
         else:
             try:
@@ -305,18 +326,24 @@ class Agent:
     async def _looks_like_instructions(self, span: str) -> Screen:
         try:
             verdict, usage = await screen_text(self.client, self.config, span)
-        except anthropic.APIError as e:
-            # Fail closed: if the screen can't run, the text doesn't get through.
+        except Exception as e:
+            # Fail closed: if the screen can't run, for any reason, the text doesn't get
+            #   through. The broad catch is deliberate here, and only here: a guard that
+            #   crashes the conversation or lets text through on an unexpected error isn't one.
             return Screen(reason=f"Screen unavailable ({type(e).__name__}).", contains_instructions=True)
         self.guard_usage.add(usage)
         return verdict
 
-    def _hand_off(self, reason: str) -> str:
+    def _hand_off(self, stop_reason: str) -> str:
         # A6 [CONTAIN]: two routes to a person. The model can choose one (hand_off_to_person),
         #   and the harness forces one when the agent can't finish (budget, refusal). Either way
         #   the reply says so honestly. In production this puts the conversation on a human work
         #   queue; here it's recorded on the session and counted in the eval report.
-        self.stop_reason = self.handoff_reason = reason
+        # stop_reason says why the loop ended; handoff_reason says why a person took over. If
+        #   the model already handed off, its reason (written for the colleague) is kept.
+        self.stop_reason = stop_reason
+        if self.handoff_reason is None:
+            self.handoff_reason = stop_reason
         return HANDOFF
 
 

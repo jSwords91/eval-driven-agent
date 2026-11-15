@@ -28,13 +28,13 @@ from typing import Literal
 
 import anthropic
 import yaml
+from mcp import MCPError
 from pydantic import BaseModel
 
 from agent import Config, connect
 from bank_server import create_db
 
 ROOT = Path(__file__).resolve().parent.parent
-TASKS = yaml.safe_load((ROOT / "evals" / "tasks.yaml").read_text())
 RESULTS = ROOT / "results"
 # The judge should be at least as capable as the agent it grades. Low effort is enough for
 # one narrow criterion at a time.
@@ -61,6 +61,41 @@ def pass_hat_k(n: int, c: int, k: int) -> float:
 # --------------------------------------------------------------------------- graders
 
 OPS = {"==": operator.eq, "<=": operator.le, ">=": operator.ge}
+GRADER_TYPES = {"state", "tool_calls", "judge"}
+
+
+def check_task(task: dict) -> None:
+    """Reject a task the graders would mis-read, when it's loaded rather than mid-run.
+
+    Without this, a misspelt grader type is silently skipped, so a task can pass on fewer
+    checks than its author wrote, and a task with no graders divides by zero.
+    """
+    tid = task.get("id", "?")
+    if not task.get("graders"):
+        raise ValueError(f"task {tid}: no graders")
+    for g in task["graders"]:
+        if g.get("type") not in GRADER_TYPES:
+            raise ValueError(f"task {tid}: unknown grader type {g.get('type')!r}")
+        if g["type"] == "state":
+            op, _, target = g["expect"].partition(" ")
+            if op not in OPS:
+                raise ValueError(f"task {tid}: grader {g['name']} has unknown operator {op!r}")
+            float(target)  # raises if the target isn't a number
+        if g["type"] == "judge" and not g.get("dimensions"):
+            raise ValueError(f"task {tid}: judge grader with no dimensions")
+
+
+def load_tasks(path: Path) -> list[dict]:
+    tasks = yaml.safe_load(path.read_text())
+    ids = [t["id"] for t in tasks]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"{path}: duplicate task ids")
+    for task in tasks:
+        check_task(task)
+    return tasks
+
+
+TASKS = load_tasks(ROOT / "evals" / "tasks.yaml")
 
 
 def grade_code(task: dict, db_path: Path, tool_log: list[dict]) -> list[dict]:
@@ -80,6 +115,8 @@ def grade_code(task: dict, db_path: Path, tool_log: list[dict]) -> list[dict]:
             detail = "; ".join([f"should not have called {called}"] * bool(called)
                                + [f"never called {missing}"] * bool(missing))
             grades.append({"name": g["name"], "passed": not (called or missing), "detail": detail})
+        elif g["type"] != "judge":  # judges run in grade_judge
+            raise ValueError(f"unknown grader type {g['type']!r}")
     return grades
 
 
@@ -123,26 +160,44 @@ async def grade_judge(client, task: dict, tool_log: list[dict], reply: str) -> l
 
 # --------------------------------------------------------------------------- trials
 
+# API outages and rate limits, an MCP server that failed to start or crashed, a missing binary.
+INFRA_ERRORS = (anthropic.APIError, MCPError, OSError)
+
+
+def leaf_errors(e: BaseException) -> list[BaseException]:
+    """The actual errors inside (possibly nested) exception groups."""
+    if isinstance(e, BaseExceptionGroup):
+        return [leaf for sub in e.exceptions for leaf in leaf_errors(sub)]
+    return [e]
+
+
 async def run_trial(task: dict, i: int, config: Config, judge_client) -> dict:
     # E8 [DE]: each trial starts clean, with its own database and its own MCP server process,
     #   so one trial can't leak state into another and cause correlated failures.
     with tempfile.TemporaryDirectory() as tmp:
         db_path = create_db(Path(tmp) / "bank.db")
         start = time.monotonic()
+        infra_error = None
+        # Infrastructure errors aren't agent failures. They're left out of pass^k and reported
+        #   separately, so they can't be read as a drop in quality. Only those are caught, and
+        #   only around the steps that call out (the agent and the judge). A bug in the harness
+        #   or in a grader (bad SQL in tasks.yaml, a KeyError) must stop the run: counting it
+        #   as an infra error would quietly shrink n and leave pass^k looking healthy.
+        #   `except*` because errors from inside the MCP client arrive wrapped in groups.
         try:
             async with connect(config, db_path) as agent:
                 reply = await agent.run(task["complaint"])
             seconds = time.monotonic() - start
-            grades = grade_code(task, db_path, agent.tool_log)
-            grades += await grade_judge(judge_client, task, agent.tool_log, reply)
-            with sqlite3.connect(db_path) as con:  # read before the trial's database is deleted
-                audit_log = [dict(zip(("ts", "role", "tool", "args", "outcome"), row))
-                             for row in con.execute("SELECT * FROM audit_log")]
-        except Exception as e:
-            # Infrastructure errors (API outages, rate limits, a crashed server) aren't agent
-            # failures. They're left out of pass^k and reported separately, so they can't be
-            # read as a drop in quality. No transcript is written for them.
-            return {"task": task["id"], "trial": i, "error": repr(e)}
+            judged = await grade_judge(judge_client, task, agent.tool_log, reply)
+        except* INFRA_ERRORS as group:
+            infra_error = group
+        if infra_error is not None:  # no transcript is written for these
+            return {"task": task["id"], "trial": i,
+                    "error": "; ".join(repr(e) for e in leaf_errors(infra_error))}
+        grades = grade_code(task, db_path, agent.tool_log) + judged
+        with sqlite3.connect(db_path) as con:  # read before the trial's database is deleted
+            audit_log = [dict(zip(("ts", "role", "tool", "args", "outcome"), row))
+                         for row in con.execute("SELECT * FROM audit_log")]
 
     path = RESULTS / "transcripts" / f"{task['id']}-{i}.json"
     summary = {
@@ -225,6 +280,20 @@ def print_failures(trials: list[dict]) -> None:
         print(f"    transcript: {t['transcript']}")
 
 
+def regression_gate(tasks: dict, threshold: float) -> tuple[float | None, bool]:
+    """Mean regression pass^k, and whether it clears the threshold.
+
+    A task without enough usable trials for pass^k counts as 0. No regression tasks at all
+    is a failure, not a pass: a gate with nothing to check proves nothing (a typo in --suite
+    or an empty tasks.yaml would otherwise turn CI green).
+    """
+    scores = [r["pass_hat_k"] or 0.0 for r in tasks.values() if r["suite"] == "regression"]
+    if not scores:
+        return None, False
+    score = sum(scores) / len(scores)
+    return score, score >= threshold
+
+
 def fmt(x: float | None) -> str:
     return "     -" if x is None else f"{x:6.2f}"
 
@@ -298,10 +367,12 @@ async def main() -> int:
     print(f"\nWrote {RESULTS / 'latest.json'} and transcripts in {RESULTS / 'transcripts'}")
 
     if args.gate is not None:
-        regression = [r["pass_hat_k"] or 0.0 for r in tasks.values() if r["suite"] == "regression"]
-        score = sum(regression) / len(regression) if regression else 1.0
-        print(f"Regression gate: mean pass^{k} {score:.2f} (need {args.gate})")
-        return 0 if score >= args.gate else 1
+        score, passed = regression_gate(tasks, args.gate)
+        if score is None:
+            print("Regression gate: FAIL, no regression tasks ran")
+        else:
+            print(f"Regression gate: mean pass^{k} {score:.2f} (need {args.gate})")
+        return 0 if passed else 1
     return 0
 
 
